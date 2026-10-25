@@ -39,6 +39,26 @@ pub const TOKEN_DAYS: i64 = 180;
 /// Most messages one `GET /api/messages` returns.
 pub const PAGE: usize = 200;
 
+// The relay's R2 budget. R2's free tier allows 10 GB stored, 1 million
+// writes (class A) and 10 million reads (class B) a month, shared by every
+// bucket on the account; these defaults keep this relay to a small part of
+// it. Each can be changed with a plain variable of the same name on the
+// worker. A day is a UTC day, so a month is at most 31 of them.
+
+/// `STORAGE_LIMIT_MB`: total size of stored files.
+pub const DEFAULT_STORAGE_MB: i64 = 2048;
+/// `UPLOADS_PER_DAY`: file uploads (one R2 put each).
+pub const DEFAULT_UPLOADS_PER_DAY: i64 = 1000;
+/// `DOWNLOADS_PER_DAY`: file downloads (one R2 get each).
+pub const DEFAULT_DOWNLOADS_PER_DAY: i64 = 10_000;
+
+/// A limit from an optional variable: a positive whole number, or `default`.
+pub fn limit_from(var: Option<&str>, default: i64) -> i64 {
+    var.and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
+}
+
 /// Who sent a message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -242,6 +262,20 @@ pub struct Status {
     /// Pairing is off until `POST /api/pair/reset`.
     pub pair_disabled: bool,
     pub messages: i64,
+    /// Bytes of stored files, and the cap.
+    #[serde(default)]
+    pub storage_bytes: i64,
+    #[serde(default)]
+    pub storage_limit: i64,
+    /// File uploads and downloads so far this UTC day, and the caps.
+    #[serde(default)]
+    pub uploads_today: i64,
+    #[serde(default)]
+    pub uploads_limit: i64,
+    #[serde(default)]
+    pub downloads_today: i64,
+    #[serde(default)]
+    pub downloads_limit: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -434,6 +468,24 @@ mod tests {
         assert!(!Message { answer: 2, ..base.clone() }.is_open_question());
         assert!(!Message { closed: true, ..base.clone() }.is_open_question());
         assert!(!Message { from: Sender::Phone, ..base }.is_open_question());
+    }
+
+    #[test]
+    fn limits_take_positive_numbers_only() {
+        assert_eq!(limit_from(None, 7), 7);
+        assert_eq!(limit_from(Some(" 500 "), 7), 500);
+        for bad in ["0", "-3", "lots", ""] {
+            assert_eq!(limit_from(Some(bad), 7), 7, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn status_from_an_older_relay_still_parses() {
+        let s: Status = serde_json::from_str(
+            r#"{"devices":[],"pair_fails":0,"pair_disabled":false,"messages":3}"#,
+        )
+        .unwrap();
+        assert_eq!((s.messages, s.storage_limit), (3, 0));
     }
 
     #[test]

@@ -30,8 +30,14 @@ code in cld-phone and export again rather than editing here.
    - optional `NTFY_URL` (an ntfy topic URL) and `NTFY_TOKEN` for push
      notifications
 
-   Optional plain variable `NTFY_PREVIEW` = `1` puts the message text in
-   notifications.
+   Optional plain variables:
+   - `NTFY_PREVIEW` = `1` puts the message text in notifications.
+   - `STORAGE_LIMIT_MB` (default 2048), `UPLOADS_PER_DAY` (default 1000) and
+     `DOWNLOADS_PER_DAY` (default 10000) cap R2 use. The defaults keep a
+     month under 2 GB stored, 31,000 writes and 310,000 reads, against the
+     free tier's 10 GB, 1 million and 10 million (shared by all buckets on
+     the account). Past a cap the relay answers 507 or 429; `cldp status`
+     shows the counts.
 6. `cldp status` should list the relay and "no phone paired".
 
 Until the secrets are set, the worker answers 401 to the host and 503 to

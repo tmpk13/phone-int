@@ -33,6 +33,14 @@ CREATE TABLE IF NOT EXISTS devices (
     last_seen INTEGER NOT NULL
 );
 
+-- R2 operations per UTC day (day = unix days): kind 'put' or 'get'.
+CREATE TABLE IF NOT EXISTS usage (
+    day INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    n INTEGER NOT NULL,
+    PRIMARY KEY (day, kind)
+);
+
 -- The single pairing gate row (see proto::gate).
 CREATE TABLE IF NOT EXISTS pairing (
     id INTEGER PRIMARY KEY CHECK (id = 1),

@@ -6,14 +6,18 @@
 //! Bindings: `DB` (D1), `FILES` (R2). Secrets: `HOST_TOKEN`, `TOTP_SECRET`,
 //! and optionally `NTFY_URL` (+ `NTFY_TOKEN`) for push notifications.
 //!
+//! Uploads, downloads and stored bytes are capped (`Limits`) so the relay
+//! stays inside R2's free tier whatever a client does.
+//!
 //! The worker creates its own tables (`schema.sql`, every statement
 //! `IF NOT EXISTS`) the first time each instance touches the database, so a
 //! deploy needs no separate migration step.
 
 use cld_phone_proto::api::{
-    decode_header_name, mime_from_name, safe_file_name, safe_mime, valid_file_id, Device,
-    ErrorBody, FileRef, Me, Message, NewMessage, PairRequest, PairResponse, Role, Sender, Status,
-    Want, KEEP_DAYS, MAX_FILE_BYTES, MAX_NAME, PAGE, TOKEN_DAYS,
+    decode_header_name, limit_from, mime_from_name, safe_file_name, safe_mime, valid_file_id,
+    Device, ErrorBody, FileRef, Me, Message, NewMessage, PairRequest, PairResponse, Role, Sender,
+    Status, Want, DEFAULT_DOWNLOADS_PER_DAY, DEFAULT_STORAGE_MB, DEFAULT_UPLOADS_PER_DAY,
+    KEEP_DAYS, MAX_FILE_BYTES, MAX_NAME, PAGE, TOKEN_DAYS,
 };
 use cld_phone_proto::gate::{Gate, PairState};
 use cld_phone_proto::{constant_time_eq, hex, sql_statements, token_digest, totp};
@@ -30,6 +34,35 @@ const ORPHAN_MS: i64 = DAY_MS;
 const SCHEMA: &str = include_str!("../schema.sql");
 /// Set once this instance has applied the schema.
 static SCHEMA_READY: AtomicBool = AtomicBool::new(false);
+/// Daily R2 counters are kept this long.
+const USAGE_KEEP_DAYS: i64 = 40;
+
+/// The R2 budget; defaults and variable names are in `cld_phone_proto::api`.
+struct Limits {
+    storage_bytes: i64,
+    uploads_per_day: i64,
+    downloads_per_day: i64,
+}
+
+impl Limits {
+    fn from_env(env: &Env) -> Limits {
+        let var = |name: &str| {
+            env.var(name)
+                .ok()
+                .map(|v| v.to_string())
+                .or_else(|| secret(env, name))
+        };
+        Limits {
+            storage_bytes: limit_from(var("STORAGE_LIMIT_MB").as_deref(), DEFAULT_STORAGE_MB)
+                .saturating_mul(1 << 20),
+            uploads_per_day: limit_from(var("UPLOADS_PER_DAY").as_deref(), DEFAULT_UPLOADS_PER_DAY),
+            downloads_per_day: limit_from(
+                var("DOWNLOADS_PER_DAY").as_deref(),
+                DEFAULT_DOWNLOADS_PER_DAY,
+            ),
+        }
+    }
+}
 
 #[event(fetch)]
 async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
@@ -136,6 +169,56 @@ async fn ensure_schema(env: &Env) -> Result<()> {
     db.batch(statements).await?;
     SCHEMA_READY.store(true, Ordering::Relaxed);
     Ok(())
+}
+
+fn today() -> i64 {
+    now_ms() / DAY_MS
+}
+
+/// Count one R2 operation of `kind` ('put' or 'get') against today's
+/// budget, or return false once `limit` is used up. One statement, so
+/// parallel requests cannot both take the last unit. It counts before the
+/// operation runs, so a failed operation still counts.
+async fn reserve(env: &Env, kind: &str, limit: i64) -> Result<bool> {
+    #[derive(Deserialize)]
+    struct Row {
+        #[allow(dead_code)]
+        n: i64,
+    }
+    let row: Option<Row> = db(env)?
+        .prepare(
+            "INSERT INTO usage (day, kind, n) VALUES (?1, ?2, 1) \
+             ON CONFLICT (day, kind) DO UPDATE SET n = n + 1 WHERE n < ?3 RETURNING n",
+        )
+        .bind(&[num(today()), kind.into(), num(limit)])?
+        .first(None)
+        .await?;
+    Ok(row.is_some())
+}
+
+async fn used_today(env: &Env, kind: &str) -> Result<i64> {
+    #[derive(Deserialize)]
+    struct Row {
+        n: i64,
+    }
+    let row: Option<Row> = db(env)?
+        .prepare("SELECT n FROM usage WHERE day = ?1 AND kind = ?2")
+        .bind(&[num(today()), kind.into()])?
+        .first(None)
+        .await?;
+    Ok(row.map(|r| r.n).unwrap_or(0))
+}
+
+async fn stored_bytes(env: &Env) -> Result<i64> {
+    #[derive(Deserialize)]
+    struct Row {
+        total: i64,
+    }
+    let row: Option<Row> = db(env)?
+        .prepare("SELECT COALESCE(SUM(size), 0) AS total FROM files")
+        .first(None)
+        .await?;
+    Ok(row.map(|r| r.total).unwrap_or(0))
 }
 
 fn now_ms() -> i64 {
@@ -340,7 +423,14 @@ async fn status(env: &Env) -> Result<Status> {
         .first(None)
         .await?;
     let pairing = load_pairing(env).await?;
+    let limits = Limits::from_env(env);
     Ok(Status {
+        storage_bytes: stored_bytes(env).await?,
+        storage_limit: limits.storage_bytes,
+        uploads_today: used_today(env, "put").await?,
+        uploads_limit: limits.uploads_per_day,
+        downloads_today: used_today(env, "get").await?,
+        downloads_limit: limits.downloads_per_day,
         devices: devices
             .into_iter()
             .map(|d| Device {
@@ -565,8 +655,41 @@ async fn upload(req: &mut Request, env: &Env) -> Result<Response> {
     let Some(stream) = req.inner().body() else {
         return json_error(400, "empty file");
     };
+
+    let limits = Limits::from_env(env);
+    if !reserve(env, "put", limits.uploads_per_day).await? {
+        let msg = format!(
+            "daily upload limit ({}) reached; it resets at 00:00 UTC",
+            limits.uploads_per_day
+        );
+        return json_error(429, &msg);
+    }
+    // Two uploads racing past this check can overshoot by one file, which the
+    // default cap leaves ample room for.
+    if stored_bytes(env).await? + length as i64 > limits.storage_bytes {
+        let msg = format!(
+            "relay storage full ({} MB); clear old messages",
+            limits.storage_bytes >> 20
+        );
+        return json_error(507, &msg);
+    }
+
+    // The row goes in before the object, so every stored object is counted
+    // and found by the cleanup even if the put dies halfway. The runtime
+    // holds the body to Content-Length, so that is its size.
     let id = random_hex(16)?;
-    let object = env
+    db(env)?
+        .prepare("INSERT INTO files (id, name, mime, size, created) VALUES (?1, ?2, ?3, ?4, ?5)")
+        .bind(&[
+            id.as_str().into(),
+            name.as_str().into(),
+            mime.as_str().into(),
+            num(length as i64),
+            num(now_ms()),
+        ])?
+        .run()
+        .await?;
+    let put = env
         .bucket("FILES")?
         .put(object_key(&id), Data::ReadableStream(stream))
         .http_metadata(HttpMetadata {
@@ -574,20 +697,21 @@ async fn upload(req: &mut Request, env: &Env) -> Result<Response> {
             ..Default::default()
         })
         .execute()
-        .await?;
-    let size = object.map(|o| o.size()).unwrap_or(length);
-    db(env)?
-        .prepare("INSERT INTO files (id, name, mime, size, created) VALUES (?1, ?2, ?3, ?4, ?5)")
-        .bind(&[
-            id.as_str().into(),
-            name.as_str().into(),
-            mime.as_str().into(),
-            num(size as i64),
-            num(now_ms()),
-        ])?
-        .run()
-        .await?;
-    Response::from_json(&FileRef { id, name, mime, size })
+        .await;
+    if let Err(e) = put {
+        db(env)?
+            .prepare("DELETE FROM files WHERE id = ?1")
+            .bind(&[id.as_str().into()])?
+            .run()
+            .await?;
+        return Err(e);
+    }
+    Response::from_json(&FileRef {
+        id,
+        name,
+        mime,
+        size: length,
+    })
 }
 
 async fn download(env: &Env, id: &str) -> Result<Response> {
@@ -598,6 +722,11 @@ async fn download(env: &Env, id: &str) -> Result<Response> {
     let Some(file) = refs.first() else {
         return json_error(404, "no such file");
     };
+    let limit = Limits::from_env(env).downloads_per_day;
+    if !reserve(env, "get", limit).await? {
+        let msg = format!("daily download limit ({limit}) reached; it resets at 00:00 UTC");
+        return json_error(429, &msg);
+    }
     let Some(object) = env.bucket("FILES")?.get(object_key(id)).execute().await? else {
         return json_error(404, "file body missing");
     };
@@ -679,6 +808,11 @@ async fn cleanup(env: &Env) -> Result<()> {
         .await?
         .results()?;
     delete_files(env, doomed.into_iter().map(|r| r.id).collect()).await?;
+
+    db.prepare("DELETE FROM usage WHERE day < ?1")
+        .bind(&[num(today() - USAGE_KEEP_DAYS)])?
+        .run()
+        .await?;
 
     db.prepare("DELETE FROM devices WHERE last_seen < ?1")
         .bind(&[num(now - TOKEN_DAYS * DAY_MS)])?
