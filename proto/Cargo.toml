@@ -1,0 +1,19 @@
+[package]
+name = "cld-phone-proto"
+description = "Wire types, TOTP and pairing rules shared by the worker, CLI and phone app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
+data-encoding = "2"
+# Blocking HTTP client for the CLI and the app; the worker leaves it off.
+ureq = { version = "3", optional = true, features = ["json"] }
+
+[features]
+client = ["dep:ureq"]

@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["proto", "worker"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The deployed wasm has a 3 MB (compressed) limit on the free plan.
+[profile.release.package.cld-phone-worker]
+opt-level = "z"
