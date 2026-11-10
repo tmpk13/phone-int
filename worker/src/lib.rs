@@ -10,14 +10,16 @@
 //! stays inside R2's free tier whatever a client does.
 //!
 //! The worker creates its own tables (`schema.sql`, every statement
-//! `IF NOT EXISTS`) the first time each instance touches the database, so a
-//! deploy needs no separate migration step.
+//! `IF NOT EXISTS`) and adds columns that came later (`ADDED_COLUMNS`) the
+//! first time each instance touches the database, so a deploy needs no
+//! separate migration step.
 
 use cld_phone_proto::api::{
     decode_header_name, limit_from, mime_from_name, safe_file_name, safe_mime, valid_file_id,
-    Device, ErrorBody, FileRef, Me, Message, NewMessage, PairRequest, PairResponse, Role, Sender,
-    Status, Want, DEFAULT_DOWNLOADS_PER_DAY, DEFAULT_STORAGE_MB, DEFAULT_UPLOADS_PER_DAY,
-    KEEP_DAYS, MAX_FILE_BYTES, MAX_NAME, PAGE, TOKEN_DAYS,
+    valid_project, Device, ErrorBody, FileRef, Me, Message, NewMessage, PairRequest,
+    PairResponse, Project, ProjectPatch, ProjectState, Role, Sender, Status, Want,
+    DEFAULT_DOWNLOADS_PER_DAY, DEFAULT_STORAGE_MB, DEFAULT_UPLOADS_PER_DAY, KEEP_DAYS,
+    MAX_FILE_BYTES, MAX_NAME, PAGE, TOKEN_DAYS,
 };
 use cld_phone_proto::gate::{Gate, PairState};
 use cld_phone_proto::{constant_time_eq, hex, sql_statements, token_digest, totp};
@@ -32,6 +34,13 @@ const SEEN_EVERY_MS: i64 = 3_600_000;
 /// Uploaded files never attached to a message are dropped after this.
 const ORPHAN_MS: i64 = DAY_MS;
 const SCHEMA: &str = include_str!("../schema.sql");
+/// Columns added to a table after it first shipped: (table, column,
+/// definition). `schema.sql` has them for new databases; older ones get them
+/// here, since SQLite has no `ADD COLUMN IF NOT EXISTS`.
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    ("messages", "project", "TEXT NOT NULL DEFAULT ''"),
+    ("messages", "done", "INTEGER NOT NULL DEFAULT 0"),
+];
 /// Set once this instance has applied the schema.
 static SCHEMA_READY: AtomicBool = AtomicBool::new(false);
 /// Daily R2 counters are kept this long.
@@ -135,6 +144,8 @@ async fn route(req: &mut Request, env: &Env, ctx: &Context) -> Result<Response> 
         (Method::Post, ["messages"]) => post_message(req, env, ctx, &caller).await,
         (Method::Delete, ["messages"]) => clear(env).await,
         (Method::Post, ["messages", id, "close"]) if host => close(env, id).await,
+        (Method::Get, ["projects"]) => list_projects(env).await,
+        (Method::Post, ["projects", name]) => patch_project(req, env, &caller, name).await,
         (Method::Post, ["files"]) => upload(req, env).await,
         (Method::Get, ["files", id]) => download(env, id).await,
         (Method::Get, ["status"]) if host => Response::from_json(&status(env).await?),
@@ -167,7 +178,35 @@ async fn ensure_schema(env: &Env) -> Result<()> {
         .map(|s| db.prepare(s.as_str()))
         .collect();
     db.batch(statements).await?;
+    add_missing_columns(&db).await?;
     SCHEMA_READY.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Add each of `ADDED_COLUMNS` that its table lacks. Two instances doing this
+/// at once can collide; the loser's request fails and its next one finds
+/// the column.
+async fn add_missing_columns(db: &D1Database) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Column {
+        name: String,
+    }
+    let mut tables: Vec<&str> = ADDED_COLUMNS.iter().map(|(t, _, _)| *t).collect();
+    tables.dedup();
+    for table in tables {
+        let have: Vec<Column> = db
+            .prepare(format!("PRAGMA table_info({table})"))
+            .all()
+            .await?
+            .results()?;
+        for (_, column, definition) in ADDED_COLUMNS.iter().filter(|(t, _, _)| *t == table) {
+            if !have.iter().any(|c| c.name == *column) {
+                db.prepare(format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"))
+                    .run()
+                    .await?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -450,6 +489,7 @@ async fn status(env: &Env) -> Result<Status> {
 #[derive(Deserialize)]
 struct MessageRow {
     id: i64,
+    project: String,
     sender: String,
     reply_to: i64,
     body: String,
@@ -459,12 +499,14 @@ struct MessageRow {
     created: i64,
     answer: i64,
     closed: i64,
+    done: i64,
 }
 
 impl MessageRow {
     fn into_message(self) -> Message {
         Message {
             id: self.id,
+            project: self.project,
             from: Sender::parse(&self.sender).unwrap_or(Sender::Claude),
             reply_to: self.reply_to,
             body: self.body,
@@ -474,6 +516,7 @@ impl MessageRow {
             created: self.created,
             answer: self.answer,
             closed: self.closed != 0,
+            done: self.done != 0,
         }
     }
 }
@@ -482,14 +525,20 @@ async fn list_messages(req: &Request, env: &Env) -> Result<Response> {
     #[derive(Deserialize)]
     struct Q {
         after: Option<i64>,
+        /// Only this project's; `""` for the ones without a project.
+        project: Option<String>,
     }
-    let after = req.query::<Q>().ok().and_then(|q| q.after).unwrap_or(0).max(0);
-    let rows: Vec<MessageRow> = db(env)?
-        .prepare("SELECT * FROM messages WHERE id > ?1 ORDER BY id LIMIT ?2")
-        .bind(&[num(after), num(PAGE as i64)])?
-        .all()
-        .await?
-        .results()?;
+    let q = req.query::<Q>().ok();
+    let after = q.as_ref().and_then(|q| q.after).unwrap_or(0).max(0);
+    let stmt = match q.and_then(|q| q.project) {
+        Some(project) => db(env)?
+            .prepare("SELECT * FROM messages WHERE id > ?1 AND project = ?3 ORDER BY id LIMIT ?2")
+            .bind(&[num(after), num(PAGE as i64), project.as_str().into()])?,
+        None => db(env)?
+            .prepare("SELECT * FROM messages WHERE id > ?1 ORDER BY id LIMIT ?2")
+            .bind(&[num(after), num(PAGE as i64)])?,
+    };
+    let rows: Vec<MessageRow> = stmt.all().await?.results()?;
     let list: Vec<Message> = rows.into_iter().map(MessageRow::into_message).collect();
     Response::from_json(&list)
 }
@@ -504,13 +553,16 @@ async fn post_message(req: &mut Request, env: &Env, ctx: &Context, caller: &Call
     }
     let db = db(env)?;
 
+    // A reply joins its question's project, whatever the sender says.
+    let mut project = new.project.clone();
     if new.reply_to != 0 {
         #[derive(Deserialize)]
         struct Target {
             sender: String,
+            project: String,
         }
         let target: Option<Target> = db
-            .prepare("SELECT sender FROM messages WHERE id = ?1")
+            .prepare("SELECT sender, project FROM messages WHERE id = ?1")
             .bind(&[num(new.reply_to)])?
             .first(None)
             .await?;
@@ -519,7 +571,7 @@ async fn post_message(req: &mut Request, env: &Env, ctx: &Context, caller: &Call
             Some(t) if t.sender == from.as_str() => {
                 return json_error(400, "reply_to: cannot answer your own message")
             }
-            Some(_) => {}
+            Some(t) => project = t.project,
         }
     }
 
@@ -529,36 +581,160 @@ async fn post_message(req: &mut Request, env: &Env, ctx: &Context, caller: &Call
     }
     let body = new.body.trim_end().to_string();
     let choices: Vec<String> = new.choices.iter().map(|c| c.trim().to_string()).collect();
+    let now = now_ms();
     let row: Option<MessageRow> = db
         .prepare(
-            "INSERT INTO messages (sender, reply_to, body, choices, want, files, created) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) RETURNING *",
+            "INSERT INTO messages (project, sender, reply_to, body, choices, want, files, created, done) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) RETURNING *",
         )
         .bind(&[
+            project.as_str().into(),
             from.as_str().into(),
             num(new.reply_to),
             body.as_str().into(),
             serde_json::to_string(&choices)?.as_str().into(),
             new.want.as_str().into(),
             serde_json::to_string(&files)?.as_str().into(),
-            num(now_ms()),
+            num(now),
+            num(new.done as i64),
         ])?
         .first(None)
         .await?;
     let msg = row
         .ok_or_else(|| Error::RustError("insert returned no row".into()))?
         .into_message();
+
+    let mut follow = Vec::new();
     if new.reply_to != 0 {
-        db.prepare("UPDATE messages SET answer = ?1 WHERE id = ?2")
-            .bind(&[num(msg.id), num(new.reply_to)])?
-            .run()
-            .await?;
+        follow.push(
+            db.prepare("UPDATE messages SET answer = ?1 WHERE id = ?2")
+                .bind(&[num(msg.id), num(new.reply_to)])?,
+        );
     }
-    if from == Sender::Claude {
-        let title = if msg.want == Want::None { "Claude" } else { "Claude asks" };
-        notify(env, ctx, title, &msg.body, msg.want != Want::None);
+    if !project.is_empty() {
+        follow.push(touch_project(&db, &project, from, msg.done, now)?);
+    }
+    if !follow.is_empty() {
+        db.batch(follow).await?;
+    }
+
+    // Questions and finished work notify; progress updates only show in
+    // the feed.
+    if from == Sender::Claude && msg.is_alert() {
+        let what = if msg.done { "done" } else { "Claude asks" };
+        let title = if project.is_empty() {
+            what.to_string()
+        } else {
+            format!("{project}: {what}")
+        };
+        notify(env, ctx, &title, &msg.body, msg.want != Want::None);
     }
     Response::from_json(&msg)
+}
+
+/// Make or update a project row for a new message: Claude's messages set the
+/// state (done or active), the phone's only bring an archived project back.
+fn touch_project(
+    db: &D1Database,
+    project: &str,
+    from: Sender,
+    done: bool,
+    now: i64,
+) -> Result<D1PreparedStatement> {
+    let state = if done { ProjectState::Done } else { ProjectState::Active };
+    let on_conflict = match from {
+        Sender::Claude => "state = excluded.state",
+        Sender::Phone => "state = CASE WHEN projects.state = 'archived' THEN 'active' ELSE projects.state END",
+    };
+    db.prepare(format!(
+        "INSERT INTO projects (name, state, created, updated) VALUES (?1, ?2, ?3, ?3) \
+         ON CONFLICT (name) DO UPDATE SET updated = excluded.updated, {on_conflict}"
+    ))
+    .bind(&[project.into(), state.as_str().into(), num(now)])
+}
+
+// ---------------------------------------------------------------- projects
+
+#[derive(Deserialize)]
+struct ProjectRow {
+    name: String,
+    about: String,
+    todos: String,
+    state: String,
+    created: i64,
+    updated: i64,
+}
+
+impl ProjectRow {
+    fn into_project(self) -> Project {
+        Project {
+            name: self.name,
+            about: self.about,
+            todos: serde_json::from_str(&self.todos).unwrap_or_default(),
+            state: ProjectState::parse(&self.state).unwrap_or_default(),
+            created: self.created,
+            updated: self.updated,
+        }
+    }
+}
+
+async fn list_projects(env: &Env) -> Result<Response> {
+    let rows: Vec<ProjectRow> = db(env)?
+        .prepare("SELECT * FROM projects ORDER BY updated DESC")
+        .all()
+        .await?
+        .results()?;
+    let list: Vec<Project> = rows.into_iter().map(ProjectRow::into_project).collect();
+    Response::from_json(&list)
+}
+
+/// Apply a [`ProjectPatch`]: absent fields keep their value (bound as NULL,
+/// so COALESCE keeps the stored one).
+async fn patch_project(req: &mut Request, env: &Env, caller: &Caller, name: &str) -> Result<Response> {
+    if !valid_project(name) {
+        return json_error(400, "bad project name");
+    }
+    let Ok(patch) = req.json::<ProjectPatch>().await else {
+        return json_error(400, "expected {about, todos, state}");
+    };
+    if let Err(e) = patch.check(caller.sender()) {
+        return json_error(400, &e);
+    }
+    let about = match &patch.about {
+        Some(a) => JsValue::from_str(a.trim()),
+        None => JsValue::NULL,
+    };
+    let todos = match &patch.todos {
+        Some(list) => {
+            let trimmed: Vec<_> = list
+                .iter()
+                .map(|t| cld_phone_proto::api::Todo {
+                    text: t.text.trim().to_string(),
+                    state: t.state,
+                })
+                .collect();
+            JsValue::from_str(&serde_json::to_string(&trimmed)?)
+        }
+        None => JsValue::NULL,
+    };
+    let state = match patch.state {
+        Some(s) => JsValue::from_str(s.as_str()),
+        None => JsValue::NULL,
+    };
+    let row: Option<ProjectRow> = db(env)?
+        .prepare(
+            "INSERT INTO projects (name, about, todos, state, created, updated) \
+             VALUES (?1, COALESCE(?2, ''), COALESCE(?3, '[]'), COALESCE(?4, 'active'), ?5, ?5) \
+             ON CONFLICT (name) DO UPDATE SET about = COALESCE(?2, about), \
+             todos = COALESCE(?3, todos), state = COALESCE(?4, state), updated = ?5 RETURNING *",
+        )
+        .bind(&[name.into(), about, todos, state, num(now_ms())])?
+        .first(None)
+        .await?;
+    match row {
+        Some(r) => Response::from_json(&r.into_project()),
+        None => Err(Error::RustError("project upsert returned no row".into())),
+    }
 }
 
 /// The stored files among `ids`, in the order asked for.
@@ -618,7 +794,9 @@ async fn clear(env: &Env) -> Result<Response> {
     }
     let ids: Vec<Id> = db(env)?.prepare("SELECT id FROM files").all().await?.results()?;
     delete_files(env, ids.into_iter().map(|r| r.id).collect()).await?;
-    db(env)?.prepare("DELETE FROM messages").run().await?;
+    let db = db(env)?;
+    db.batch(vec![db.prepare("DELETE FROM messages"), db.prepare("DELETE FROM projects")])
+        .await?;
     Response::from_json(&serde_json::json!({ "ok": true }))
 }
 
@@ -782,7 +960,8 @@ async fn delete_files(env: &Env, ids: Vec<String>) -> Result<()> {
 
 // ---------------------------------------------------------------- upkeep
 
-/// Daily: drop old messages, their files, unattached uploads and idle devices.
+/// Daily: drop old messages, their files, projects left with neither
+/// messages nor recent changes, unattached uploads and idle devices.
 async fn cleanup(env: &Env) -> Result<()> {
     let now = now_ms();
     let old = now - KEEP_DAYS * DAY_MS;
@@ -791,6 +970,13 @@ async fn cleanup(env: &Env) -> Result<()> {
         .bind(&[num(old)])?
         .run()
         .await?;
+    db.prepare(
+        "DELETE FROM projects WHERE updated < ?1 AND NOT EXISTS \
+         (SELECT 1 FROM messages WHERE messages.project = projects.name)",
+    )
+    .bind(&[num(old)])?
+    .run()
+    .await?;
 
     // A file is kept while a surviving message names it, or while it is
     // fresh enough to still be attached.

@@ -9,7 +9,8 @@ use ureq::http::Response;
 use ureq::{Agent, Body};
 
 use crate::api::{
-    ErrorBody, FileRef, Me, Message, NewMessage, PairRequest, PairResponse, Status, MAX_FILE_BYTES,
+    ErrorBody, FileRef, Me, Message, NewMessage, PairRequest, PairResponse, Project, ProjectPatch,
+    Status, MAX_FILE_BYTES,
 };
 
 /// Why a call failed.
@@ -161,6 +162,23 @@ impl Client {
     /// Messages with ids above `after`, oldest first, at most a page.
     pub fn messages(&self, after: i64) -> Result<Vec<Message>> {
         json(self.get(&format!("/api/messages?after={after}"))?)
+    }
+
+    /// Like [`Client::messages`], but only those in `project` (`""` for
+    /// the ones without a project).
+    pub fn project_messages(&self, after: i64, project: &str) -> Result<Vec<Message>> {
+        json(self.get(&format!("/api/messages?after={after}&project={project}"))?)
+    }
+
+    /// Every project, latest activity first.
+    pub fn projects(&self) -> Result<Vec<Project>> {
+        json(self.get("/api/projects")?)
+    }
+
+    /// Change a project (made if missing). `name` must pass
+    /// [`crate::api::valid_project`], which also keeps it URL safe.
+    pub fn update_project(&self, name: &str, patch: &ProjectPatch) -> Result<Project> {
+        json(self.post_json(&format!("/api/projects/{name}"), patch)?)
     }
 
     pub fn send(&self, msg: &NewMessage) -> Result<Message> {

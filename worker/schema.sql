@@ -3,8 +3,11 @@
 
 -- AUTOINCREMENT keeps ids rising after a clear, so a client polling with
 -- `after=<last id>` never misses messages that reuse old ids.
+-- `project` and `done` came later: databases made before them get the
+-- columns from ADDED_COLUMNS in src/lib.rs, which also lists them.
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project TEXT NOT NULL DEFAULT '',      -- '' for none
     sender TEXT NOT NULL,                  -- 'claude' or 'phone'
     reply_to INTEGER NOT NULL DEFAULT 0,
     body TEXT NOT NULL DEFAULT '',
@@ -13,7 +16,18 @@ CREATE TABLE IF NOT EXISTS messages (
     files TEXT NOT NULL DEFAULT '[]',      -- JSON array of FileRef
     created INTEGER NOT NULL,              -- unix ms
     answer INTEGER NOT NULL DEFAULT 0,     -- latest reply id
-    closed INTEGER NOT NULL DEFAULT 0
+    closed INTEGER NOT NULL DEFAULT 0,
+    done INTEGER NOT NULL DEFAULT 0        -- Claude: the work is finished
+);
+
+-- One row per named project, made by its first message or change.
+CREATE TABLE IF NOT EXISTS projects (
+    name TEXT PRIMARY KEY,
+    about TEXT NOT NULL DEFAULT '',
+    todos TEXT NOT NULL DEFAULT '[]',      -- JSON array of Todo
+    state TEXT NOT NULL DEFAULT 'active',  -- 'active', 'done' or 'archived'
+    created INTEGER NOT NULL,
+    updated INTEGER NOT NULL               -- latest message or change
 );
 
 -- Bodies live in R2 under f/<id>.

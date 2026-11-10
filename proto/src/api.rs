@@ -4,8 +4,10 @@
 //! | --- | --- | --- | --- |
 //! | POST | `/api/pair` | anyone | [`PairRequest`] -> [`PairResponse`] |
 //! | GET | `/api/me` | host, phone | [`Me`] |
-//! | GET | `/api/messages?after=N` | host, phone | `Vec<`[`Message`]`>` (ids above N, oldest first) |
+//! | GET | `/api/messages?after=N[&project=P]` | host, phone | `Vec<`[`Message`]`>` (ids above N, oldest first) |
 //! | POST | `/api/messages` | host, phone | [`NewMessage`] -> [`Message`] |
+//! | GET | `/api/projects` | host, phone | `Vec<`[`Project`]`>` (latest activity first) |
+//! | POST | `/api/projects/<name>` | host, phone | [`ProjectPatch`] -> [`Project`] |
 //! | POST | `/api/messages/<id>/close` | host | the closed [`Message`] |
 //! | DELETE | `/api/messages` | host, phone | clears every message and file |
 //! | POST | `/api/files` | host, phone | raw bytes, `x-file-name` header -> [`FileRef`] |
@@ -17,6 +19,10 @@
 //! The host authenticates with the `HOST_TOKEN` secret, a phone with the
 //! token `/api/pair` gave it, both as `Authorization: Bearer <token>`.
 //! Errors answer with a status code and an [`ErrorBody`].
+//!
+//! Every message belongs to a project (a repo name such as `cld-phone`), or
+//! to none (`""`, shown as "General"). Posting a message creates its project
+//! and keeps the project's state current; see [`ProjectState`].
 
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +38,18 @@ pub const MAX_FILES: usize = 20;
 pub const MAX_FILE_BYTES: u64 = 30 * 1024 * 1024;
 /// Longest file or device name, in bytes.
 pub const MAX_NAME: usize = 120;
+/// Longest project name, in bytes (see [`valid_project`]).
+pub const MAX_PROJECT: usize = 64;
+/// Longest progress update (a Claude message that asks nothing), in
+/// characters: updates are read as one line in a feed on a phone. Details
+/// go in an attached file.
+pub const MAX_UPDATE: usize = 200;
+/// Longest project description, in characters.
+pub const MAX_ABOUT: usize = 200;
+/// Most items on a project's todo list.
+pub const MAX_TODOS: usize = 30;
+/// Longest todo item, in characters.
+pub const MAX_TODO: usize = 120;
 /// Messages and files older than this are deleted by the daily cleanup.
 pub const KEEP_DAYS: i64 = 14;
 /// A device token lasts this long after its last use.
@@ -141,6 +159,10 @@ impl FileRef {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
     pub id: i64,
+    /// The project it belongs to; `""` for none. A reply always takes its
+    /// question's project.
+    #[serde(default)]
+    pub project: String,
     pub from: Sender,
     /// The message this answers, or 0.
     pub reply_to: i64,
@@ -155,12 +177,21 @@ pub struct Message {
     pub answer: i64,
     /// Claude no longer needs an answer.
     pub closed: bool,
+    /// Claude says the project's work is finished.
+    #[serde(default)]
+    pub done: bool,
 }
 
 impl Message {
     /// A question still waiting on the phone.
     pub fn is_open_question(&self) -> bool {
         self.from == Sender::Claude && self.want != Want::None && self.answer == 0 && !self.closed
+    }
+
+    /// Worth a notification: an open question, or the work being finished.
+    /// Progress updates only land in the feed.
+    pub fn is_alert(&self) -> bool {
+        self.is_open_question() || (self.from == Sender::Claude && self.done)
     }
 }
 
@@ -178,6 +209,12 @@ pub struct NewMessage {
     pub files: Vec<String>,
     #[serde(default)]
     pub reply_to: i64,
+    /// `""` for none; ignored on a reply, which joins its question's project.
+    #[serde(default)]
+    pub project: String,
+    /// The project's work is finished (Claude's updates only).
+    #[serde(default)]
+    pub done: bool,
 }
 
 impl NewMessage {
@@ -188,6 +225,20 @@ impl NewMessage {
         }
         if self.body.len() > MAX_BODY {
             return Err(format!("text over {MAX_BODY} bytes"));
+        }
+        if !self.project.is_empty() && !valid_project(&self.project) {
+            return Err(format!("bad project name {:?}", self.project));
+        }
+        let update = from == Sender::Claude && self.want == Want::None;
+        let chars = self.body.trim().chars().count();
+        if update && chars > MAX_UPDATE {
+            return Err(format!(
+                "an update is at most {MAX_UPDATE} characters ({chars} given); \
+                 keep it to one line and attach details as a file"
+            ));
+        }
+        if self.done && !update {
+            return Err("only Claude's updates mark a project done".into());
         }
         if self.files.len() > MAX_FILES {
             return Err(format!("more than {MAX_FILES} files"));
@@ -213,6 +264,148 @@ impl NewMessage {
         }
         Ok(())
     }
+}
+
+/// Where a project stands. Claude's updates move it between active and
+/// done; only the user archives it, and any new message brings it back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectState {
+    #[default]
+    Active,
+    /// Claude's last update said the work is finished.
+    Done,
+    /// Off the main feed until something new happens in it.
+    Archived,
+}
+
+impl ProjectState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProjectState::Active => "active",
+            ProjectState::Done => "done",
+            ProjectState::Archived => "archived",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<ProjectState> {
+        match text {
+            "active" => Some(ProjectState::Active),
+            "done" => Some(ProjectState::Done),
+            "archived" => Some(ProjectState::Archived),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TodoState {
+    #[default]
+    Todo,
+    Doing,
+    Done,
+}
+
+/// One item on a project's todo list.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Todo {
+    pub text: String,
+    #[serde(default)]
+    pub state: TodoState,
+}
+
+/// A project as `GET /api/projects` lists it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Project {
+    pub name: String,
+    /// One line on what the project is.
+    pub about: String,
+    pub todos: Vec<Todo>,
+    pub state: ProjectState,
+    /// Unix milliseconds.
+    pub created: i64,
+    /// The latest message or change, unix milliseconds.
+    pub updated: i64,
+}
+
+impl Project {
+    /// (done, total) todo items.
+    pub fn progress(&self) -> (usize, usize) {
+        let done = self.todos.iter().filter(|t| t.state == TodoState::Done).count();
+        (done, self.todos.len())
+    }
+}
+
+/// `POST /api/projects/<name>`: the fields to change; the project is made
+/// if it does not exist. A phone may only set the state, to active or
+/// archived.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub about: Option<String>,
+    /// Replaces the whole list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub todos: Option<Vec<Todo>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<ProjectState>,
+}
+
+impl ProjectPatch {
+    /// Problems the worker refuses with 400, for a change from `from`.
+    pub fn check(&self, from: Sender) -> Result<(), String> {
+        if from == Sender::Phone {
+            if self.about.is_some() || self.todos.is_some() {
+                return Err("a phone only archives or restores projects".into());
+            }
+            if self.state == Some(ProjectState::Done) {
+                return Err("only Claude marks a project done".into());
+            }
+        }
+        if let Some(about) = &self.about {
+            if about.trim().chars().count() > MAX_ABOUT {
+                return Err(format!("about is at most {MAX_ABOUT} characters"));
+            }
+        }
+        if let Some(todos) = &self.todos {
+            if todos.len() > MAX_TODOS {
+                return Err(format!("at most {MAX_TODOS} todo items"));
+            }
+            if todos
+                .iter()
+                .any(|t| t.text.trim().is_empty() || t.text.trim().chars().count() > MAX_TODO)
+            {
+                return Err(format!("todo items are 1 to {MAX_TODO} characters"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A project name: 1 to [`MAX_PROJECT`] ASCII letters, digits, `.`, `_` or
+/// `-`, starting with a letter or digit. Safe in a URL path and a file name.
+pub fn valid_project(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_PROJECT
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(b))
+}
+
+/// The nearest valid project name to `raw` (a directory name, say): other
+/// characters become `-`, the front is trimmed to a letter or digit, and the
+/// result is cut to [`MAX_PROJECT`]. `None` when nothing usable is left.
+pub fn project_name(raw: &str) -> Option<String> {
+    let mapped: String = raw
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '-' })
+        .collect();
+    let trimmed = mapped.trim_start_matches(|c: char| !c.is_ascii_alphanumeric());
+    let cut: String = trimmed.chars().take(MAX_PROJECT).collect();
+    let cut = cut.trim_end_matches('-').to_string();
+    valid_project(&cut).then_some(cut)
 }
 
 /// `POST /api/pair`.
@@ -389,6 +582,7 @@ mod tests {
     fn json_shape_is_stable() {
         let m = Message {
             id: 3,
+            project: "bench".into(),
             from: Sender::Claude,
             reply_to: 0,
             body: "Which rev?".into(),
@@ -398,14 +592,22 @@ mod tests {
             created: 1,
             answer: 0,
             closed: false,
+            done: false,
         };
         let text = serde_json::to_string(&m).unwrap();
         assert_eq!(
             text,
-            r#"{"id":3,"from":"claude","reply_to":0,"body":"Which rev?","choices":["A","B"],"want":"photo","files":[],"created":1,"answer":0,"closed":false}"#
+            r#"{"id":3,"project":"bench","from":"claude","reply_to":0,"body":"Which rev?","choices":["A","B"],"want":"photo","files":[],"created":1,"answer":0,"closed":false,"done":false}"#
         );
         assert_eq!(serde_json::from_str::<Message>(&text).unwrap(), m);
         assert!(m.is_open_question());
+    }
+
+    #[test]
+    fn messages_from_a_relay_without_projects_still_parse() {
+        let old = r#"{"id":3,"from":"phone","reply_to":0,"body":"hi","choices":[],"want":"text","files":[],"created":1,"answer":0,"closed":false}"#;
+        let m: Message = serde_json::from_str(old).unwrap();
+        assert_eq!((m.project.as_str(), m.done), ("", false));
     }
 
     #[test]
@@ -453,6 +655,7 @@ mod tests {
     fn notices_and_answered_or_closed_questions_are_not_open() {
         let base = Message {
             id: 1,
+            project: String::new(),
             from: Sender::Claude,
             reply_to: 0,
             body: "x".into(),
@@ -462,12 +665,124 @@ mod tests {
             created: 0,
             answer: 0,
             closed: false,
+            done: false,
         };
         assert!(base.is_open_question());
         assert!(!Message { want: Want::None, ..base.clone() }.is_open_question());
         assert!(!Message { answer: 2, ..base.clone() }.is_open_question());
         assert!(!Message { closed: true, ..base.clone() }.is_open_question());
-        assert!(!Message { from: Sender::Phone, ..base }.is_open_question());
+        assert!(!Message { from: Sender::Phone, ..base.clone() }.is_open_question());
+
+        let update = Message { want: Want::None, ..base.clone() };
+        assert!(!update.is_alert(), "progress updates only go to the feed");
+        assert!(Message { done: true, ..update }.is_alert());
+        assert!(base.is_alert());
+    }
+
+    #[test]
+    fn updates_are_one_short_line() {
+        let update = |body: &str| NewMessage {
+            want: Want::None,
+            ..msg(body)
+        };
+        assert!(update(&"x".repeat(MAX_UPDATE)).check(Sender::Claude).is_ok());
+        let long = update(&"x".repeat(MAX_UPDATE + 1)).check(Sender::Claude).unwrap_err();
+        assert!(long.contains("attach details"), "{long}");
+        // Counted in characters, so non-ASCII text gets the same room.
+        assert!(update(&"\u{e9}".repeat(MAX_UPDATE)).check(Sender::Claude).is_ok());
+        // Questions and the phone's messages keep the full length.
+        assert!(msg(&"x".repeat(5000)).check(Sender::Claude).is_ok());
+        assert!(msg(&"x".repeat(5000)).check(Sender::Phone).is_ok());
+    }
+
+    #[test]
+    fn only_claude_updates_mark_done() {
+        let done = NewMessage {
+            want: Want::None,
+            done: true,
+            ..msg("Shipped")
+        };
+        assert!(done.check(Sender::Claude).is_ok());
+        let question = NewMessage {
+            want: Want::Text,
+            ..done.clone()
+        };
+        assert!(question.check(Sender::Claude).is_err());
+        let phone = NewMessage {
+            want: Want::Text,
+            ..done
+        };
+        assert!(phone.check(Sender::Phone).is_err());
+    }
+
+    #[test]
+    fn project_names_are_url_and_file_safe() {
+        for good in ["cld-phone", "AT86RF215", "v1.2_test", "a"] {
+            assert!(valid_project(good), "{good}");
+        }
+        for bad in ["", ".", "..", "-x", "a/b", "a b", "\u{e9}t\u{e9}", &"x".repeat(MAX_PROJECT + 1)] {
+            assert!(!valid_project(bad), "{bad:?}");
+        }
+        let bad = NewMessage {
+            project: "../x".into(),
+            ..msg("hi")
+        };
+        assert!(bad.check(Sender::Claude).is_err());
+        assert!(msg("hi").check(Sender::Claude).is_ok(), "no project is fine");
+    }
+
+    #[test]
+    fn project_names_from_directory_names() {
+        assert_eq!(project_name("cld-phone").as_deref(), Some("cld-phone"));
+        assert_eq!(project_name("My Project (old)").as_deref(), Some("My-Project--old"));
+        assert_eq!(project_name(".hidden").as_deref(), Some("hidden"));
+        assert_eq!(project_name("caf\u{e9}").as_deref(), Some("caf"));
+        assert_eq!(project_name("/").as_deref(), None);
+        assert_eq!(project_name(&"y".repeat(100)).map(|n| n.len()), Some(MAX_PROJECT));
+    }
+
+    #[test]
+    fn project_patches_by_role() {
+        let todos = ProjectPatch {
+            todos: Some(vec![Todo {
+                text: "Parse".into(),
+                state: TodoState::Doing,
+            }]),
+            ..Default::default()
+        };
+        assert!(todos.check(Sender::Claude).is_ok());
+        assert!(todos.check(Sender::Phone).is_err(), "the phone does not edit plans");
+        let archive = ProjectPatch {
+            state: Some(ProjectState::Archived),
+            ..Default::default()
+        };
+        assert!(archive.check(Sender::Phone).is_ok());
+        let done = ProjectPatch {
+            state: Some(ProjectState::Done),
+            ..Default::default()
+        };
+        assert!(done.check(Sender::Phone).is_err());
+        let blank = ProjectPatch {
+            todos: Some(vec![Todo {
+                text: " ".into(),
+                state: TodoState::Todo,
+            }]),
+            ..Default::default()
+        };
+        assert!(blank.check(Sender::Claude).is_err());
+        let many = ProjectPatch {
+            todos: Some(vec![
+                Todo {
+                    text: "x".into(),
+                    state: TodoState::Todo
+                };
+                MAX_TODOS + 1
+            ]),
+            ..Default::default()
+        };
+        assert!(many.check(Sender::Claude).is_err());
+        // Absent fields stay out of the JSON, so they are left alone.
+        assert_eq!(serde_json::to_string(&archive).unwrap(), r#"{"state":"archived"}"#);
     }
 
     #[test]
